@@ -17,9 +17,12 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .tenant_context import TenantContext
 
 
 def _now() -> datetime:
@@ -584,10 +587,22 @@ def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    tenant: Optional["TenantContext"] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
+
+    Tenant isolation (Hermes-lite beta):
+      - When ``tenant`` is provided AND ``tenant.trust_tier == "beta"`` (or
+        any non-operator/non-unknown tier), the key is rewritten to
+        ``agent:main:<platform>:tenant:<tenant_id>:<chat_type>`` so the raw
+        phone/email never appears in storage paths or transcripts. Group
+        sessions are forcibly per-user for beta tenants regardless of the
+        global ``group_sessions_per_user`` setting.
+      - When ``tenant.trust_tier in ("operator", "unknown")`` or ``tenant
+        is None``, the legacy behavior below applies unchanged. The operator
+        keeps their existing session keys; admin tooling is unaffected.
 
     DM rules:
       - DMs include chat_id when present, so each private conversation is isolated.
@@ -609,6 +624,18 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     platform = source.platform.value
+
+    # ------------------------------------------------------------------
+    # Tenant-isolated keys (Hermes-lite beta).
+    # Operator and unknown tenants fall through to the legacy path so admin
+    # tooling and fail-closed paths keep their existing behavior.
+    # ------------------------------------------------------------------
+    if tenant is not None and tenant.trust_tier not in ("operator", "unknown"):
+        key_parts = ["agent:main", platform, "tenant", tenant.tenant_id, source.chat_type]
+        if source.thread_id:
+            key_parts.append(source.thread_id)
+        return ":".join(key_parts)
+
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:

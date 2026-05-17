@@ -14,6 +14,7 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -67,6 +68,146 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+
+_LITE_BETA_ADMIN_NOTICE_PATH = Path(
+    "/Users/hermes-life/runs/imessage-beta-worker/state/admin-notices.jsonl"
+)
+
+
+def _lite_beta_approval_autodeny_enabled() -> bool:
+    """Return True for the Hermes-lite beta profile.
+
+    Hermes-lite beta users should never receive command-approval prompts.  The
+    full/life agent still keeps the normal approval UX.
+    """
+    marker = " ".join(
+        str(os.environ.get(name, ""))
+        for name in ("HERMES_HOME", "HERMES_AGENT_HOME")
+    ).lower()
+    return "/lite/" in marker or marker.endswith("/lite")
+
+
+def _lite_beta_approval_user_notice() -> str:
+    return (
+        "Sorry, that action needs admin-only permissions, so I can't run it "
+        "in beta yet. I've reported it to the admin."
+    )
+
+
+def _redact_lite_beta_notice_text(text: str) -> str:
+    """Small local redactor for commands before writing admin notices."""
+    redacted = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s'\"]+",
+        r"\1[REDACTED]",
+        text or "",
+    )
+    redacted = re.sub(
+        r"(?i)((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s'\"]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", redacted)
+    return redacted
+
+
+def _build_lite_beta_approval_admin_notice(
+    *,
+    user_id: str,
+    chat_id: str,
+    user_text: str,
+    command: str,
+    description: str,
+) -> str:
+    """Build concise Hermes-life admin notice for a beta auto-deny event."""
+    cmd = _redact_lite_beta_notice_text(command).replace("\n", " ")
+    if len(cmd) > 360:
+        cmd = cmd[:357] + "..."
+    user_text = (user_text or "").replace("\n", " ")[:240]
+    description = (description or "approval required").replace("\n", " ")[:240]
+    return (
+        "Beta safety event: approval auto-denied\n"
+        f"User: {user_id or 'unknown'}\n"
+        f"Chat: {chat_id or 'unknown'}\n"
+        f"Request: {user_text or '(empty)'}\n"
+        f"Reason: {description}\n"
+        f"Command: {cmd}\n"
+        "Action: beta user was not shown an approval prompt; case queued for admin review."
+    )
+
+
+def _queue_lite_beta_approval_admin_notice(message: str) -> None:
+    """Append an admin notice for Hermes-life to deliver asynchronously."""
+    try:
+        _LITE_BETA_ADMIN_NOTICE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": time.time(),
+            "kind": "lite_beta_approval_autodeny",
+            "message": message,
+        }
+        with _LITE_BETA_ADMIN_NOTICE_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to queue lite beta admin approval notice: %s", exc)
+
+
+def _handle_lite_beta_approval_autodeny(
+    *,
+    approval_data: dict,
+    source: Any,
+    event_text: str,
+    status_adapter: Any,
+    status_chat_id: str,
+    status_thread_metadata: Optional[dict],
+    loop: asyncio.AbstractEventLoop,
+    approval_session_key: str,
+) -> bool:
+    """Handle Hermes-lite beta approval requests as immediate denials.
+
+    Returns True when the request was handled. Returns False outside the
+    Hermes-lite beta profile so normal gateway approval UX can continue.
+    """
+    if not _lite_beta_approval_autodeny_enabled():
+        return False
+
+    cmd = approval_data.get("command", "")
+    desc = approval_data.get("description", "dangerous command")
+    user_id = getattr(source, "user_id", None) or getattr(source, "user_name", None) or "unknown"
+    chat_id = getattr(source, "chat_id", None) or "unknown"
+    admin_notice = _build_lite_beta_approval_admin_notice(
+        user_id=user_id,
+        chat_id=chat_id,
+        user_text=event_text or "",
+        command=cmd,
+        description=desc,
+    )
+    _queue_lite_beta_approval_admin_notice(admin_notice)
+
+    try:
+        asyncio.run_coroutine_threadsafe(
+            status_adapter.send(
+                status_chat_id,
+                _lite_beta_approval_user_notice(),
+                metadata=status_thread_metadata,
+            ),
+            loop,
+        ).result(timeout=15)
+    except Exception as exc:
+        logger.error("Failed to send lite beta auto-deny notice: %s", exc)
+
+    try:
+        from tools.approval import resolve_gateway_approval
+        resolve_gateway_approval(approval_session_key, "deny")
+    except Exception as exc:
+        logger.error("Failed to resolve lite beta approval as deny: %s", exc)
+
+    try:
+        resume = getattr(status_adapter, "resume_typing_for_chat", None)
+        if resume is not None:
+            resume(status_chat_id)
+    except Exception as exc:
+        logger.debug("Failed to resume typing after lite beta auto-deny: %s", exc)
+
+    return True
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -1253,6 +1394,67 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _resolve_tenant(self, source: SessionSource):
+        """Resolve a TenantContext for the given source. Never raises.
+
+        Lazily constructs ``self._tenant_resolver`` from env on first call.
+        Returns ``TenantContext.unknown()`` for any error path so callers can
+        safely use the result without try/except.
+
+        Shadow stage: this is called purely for observability. The returned
+        tenant is NOT yet passed to ``build_session_key`` in production —
+        that gate flips when the enforce-stage config flag is added.
+        """
+        from .tenant_context import TenantContext
+
+        if getattr(self, "_tenant_resolver", None) is None:
+            try:
+                from .tenant_resolver import build_tenant_resolver_from_env
+                self._tenant_resolver = build_tenant_resolver_from_env()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("tenant_resolver bootstrap failed: %s", exc)
+                return TenantContext.unknown()
+
+        platform = source.platform.value if getattr(source, "platform", None) else ""
+        raw_user_id = source.user_id or ""
+        if not platform or not raw_user_id:
+            return TenantContext.unknown()
+
+        try:
+            return self._tenant_resolver.resolve(platform, raw_user_id)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("tenant_resolver.resolve failed: %s", exc)
+            return TenantContext.unknown()
+
+    @contextlib.contextmanager
+    def _push_tenant(self, source: SessionSource):
+        """Resolve a tenant for ``source`` and bind it to ``current_tenant``.
+
+        Use as a ``with`` block around message handling so the contextvar is
+        always reset (even on exceptions) and concurrent handlers stay
+        isolated. Emits exactly one ``tenant.resolved`` log line per call.
+
+        Shadow stage: the tenant is only logged, not yet routed into
+        ``build_session_key``. Production behavior is unchanged.
+        """
+        from .tenant_context import current_tenant
+
+        tenant = self._resolve_tenant(source)
+        # Shadow-stage log: never include raw phone/email. The tenant_id is
+        # opaque (btu_*/op_self/unknown), so this line is safe to keep at
+        # INFO indefinitely.
+        logger.info(
+            "tenant.resolved platform=%s trust_tier=%s tenant_id=%s",
+            tenant.platform or (source.platform.value if source.platform else ""),
+            tenant.trust_tier,
+            tenant.tenant_id,
+        )
+        token = current_tenant.set(tenant)
+        try:
+            yield tenant
+        finally:
+            current_tenant.reset(token)
 
     def _resolve_session_agent_runtime(
         self,
@@ -4164,6 +4366,24 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        # Phase 1c — shadow stage. Resolve and bind a TenantContext for this
+        # message. ContextVars are per-asyncio-task, so each handler invocation
+        # gets its own copy — leaving the var set at the end of the handler is
+        # safe (it doesn't leak to other concurrent message handlers).
+        #
+        # Today this is observability only: build_session_key is NOT yet
+        # called with tenant=, so production routing is unchanged. The
+        # enforce stage flips that gate behind a config flag.
+        from .tenant_context import current_tenant as _current_tenant
+        _tenant = self._resolve_tenant(source)
+        logger.info(
+            "tenant.resolved platform=%s trust_tier=%s tenant_id=%s",
+            _tenant.platform or (source.platform.value if source.platform else ""),
+            _tenant.trust_tier,
+            _tenant.tenant_id,
+        )
+        _current_tenant.set(_tenant)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -11953,6 +12173,20 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+
+                # Hermes-lite beta UX: beta users should never see exec approval
+                # prompts or wait for admin intervention.
+                if _handle_lite_beta_approval_autodeny(
+                    approval_data=approval_data,
+                    source=source,
+                    event_text=event.text or "",
+                    status_adapter=_status_adapter,
+                    status_chat_id=_status_chat_id,
+                    status_thread_metadata=_status_thread_metadata,
+                    loop=_loop_for_step,
+                    approval_session_key=_approval_session_key,
+                ):
+                    return
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
