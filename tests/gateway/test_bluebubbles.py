@@ -1,4 +1,6 @@
 """Tests for the BlueBubbles iMessage gateway adapter."""
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -96,6 +98,25 @@ class TestBlueBubblesHelpers:
 
         assert result.success is True
         assert sent == ["first thought", "second thought"]
+
+    @pytest.mark.asyncio
+    async def test_connect_send_only_does_not_start_or_unregister_webhook(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_api_get(path):
+            if path == "/api/v1/server/info":
+                return {"data": {"private_api": True, "helper_connected": True}}
+            return {"data": "pong"}
+
+        monkeypatch.setattr(adapter, "_api_get", fake_api_get)
+        monkeypatch.setattr(adapter, "_register_webhook", AsyncMock(side_effect=AssertionError("webhook registered")))
+        monkeypatch.setattr(adapter, "_unregister_webhook", AsyncMock(side_effect=AssertionError("webhook unregistered")))
+
+        assert await adapter.connect_send_only() is True
+        assert adapter._runner is None
+        assert adapter._webhook_registered is False
+
+        await adapter.disconnect()
 
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)

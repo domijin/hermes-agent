@@ -126,6 +126,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
+        self._webhook_registered: bool = False
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
@@ -154,13 +155,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def _connect_rest_client(self) -> bool:
+        """Connect to the BlueBubbles REST API without starting a webhook.
+
+        Outbound-only send paths use this helper so they do not try to bind
+        the gateway's inbound webhook port a second time.
+        """
         if not self.server_url or not self.password:
             logger.error(
                 "[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required"
             )
             return False
-        from aiohttp import web
 
         self.client = httpx.AsyncClient(timeout=30.0)
         try:
@@ -184,6 +189,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 self.client = None
             return False
 
+        self._mark_connected()
+        return True
+
+    async def connect_send_only(self) -> bool:
+        """Connect for outbound sends only; do not bind/register webhook."""
+        return await self._connect_rest_client()
+
+    async def connect(self) -> bool:
+        if not await self._connect_rest_client():
+            return False
+        from aiohttp import web
+
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
@@ -191,7 +208,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
         await site.start()
-        self._mark_connected()
         logger.info(
             "[bluebubbles] webhook listening on http://%s:%s%s",
             self.webhook_host,
@@ -202,12 +218,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         # Register webhook with BlueBubbles server
         # This is required for the server to know where to send events
         await self._register_webhook()
+        self._webhook_registered = True
 
         return True
 
     async def disconnect(self) -> None:
-        # Unregister webhook before cleaning up
-        await self._unregister_webhook()
+        # Unregister only if this adapter instance registered the webhook.
+        # Send-only adapters must not unregister the live gateway webhook.
+        if self._webhook_registered:
+            await self._unregister_webhook()
+            self._webhook_registered = False
 
         if self.client:
             await self.client.aclose()
@@ -222,7 +242,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         """Compute the external webhook URL for BlueBubbles registration."""
         host = self.webhook_host
         if host in ("0.0.0.0", "127.0.0.1", "localhost", "::"):
-            host = "localhost"
+            host = "127.0.0.1"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     @property
@@ -273,7 +293,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         payload = {
             "url": webhook_url,
-            "events": ["new-message", "updated-message"],
+            "events": ["new-message"],
         }
 
         try:
@@ -346,11 +366,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         target = (target or "").strip()
         if not target:
             return None
-        # Already a raw GUID
-        if ";" in target:
+        canonical_dm = re.match(r"^any;-;(\+\d{7,15})$", target)
+        lookup_target = canonical_dm.group(1) if canonical_dm else target
+        # Already a raw GUID. Canonical 1:1 phone GUIDs are resolved by handle
+        # first so a not-yet-created chat can fall back to /chat/new instead
+        # of posting to a guessed GUID and triggering a server-side 500.
+        if ";" in target and not canonical_dm:
             return target
-        if target in self._guid_cache:
-            return self._guid_cache[target]
+        if lookup_target in self._guid_cache:
+            return self._guid_cache[lookup_target]
         try:
             payload = await self._api_post(
                 "/api/v1/chat/query",
@@ -359,12 +383,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             for chat in payload.get("data", []) or []:
                 guid = chat.get("guid") or chat.get("chatGuid")
                 identifier = chat.get("chatIdentifier") or chat.get("identifier")
-                if identifier == target:
+                if identifier == lookup_target:
                     if guid:
+                        self._guid_cache[lookup_target] = guid
                         self._guid_cache[target] = guid
                     return guid
                 for part in chat.get("participants", []) or []:
-                    if (part.get("address") or "").strip() == target and guid:
+                    if (part.get("address") or "").strip() == lookup_target and guid:
+                        self._guid_cache[lookup_target] = guid
                         self._guid_cache[target] = guid
                         return guid
         except Exception:
@@ -386,7 +412,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             msg_id = data.get("guid") or data.get("messageGuid") or "ok"
             return SendResult(success=True, message_id=str(msg_id), raw_response=res)
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            return SendResult(success=False, error=f"{type(exc).__name__}: {str(exc) or repr(exc)}")
 
     # ------------------------------------------------------------------
     # Text sending
@@ -423,11 +449,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
-                # If the target looks like an address, try creating a new chat
+                # If the target looks like an address, try creating a new chat.
+                # Also support canonical BlueBubbles DM GUIDs (any;-;+E164)
+                # by extracting the handle for first-contact sends while the
+                # tool result still reports the canonical chat_id.
+                canonical_dm = re.match(r"^any;-;(\+\d{7,15})$", chat_id or "")
+                create_address = canonical_dm.group(1) if canonical_dm else chat_id
                 if self._private_api_enabled and (
-                    "@" in chat_id or re.match(r"^\+\d+", chat_id)
+                    "@" in create_address or re.match(r"^\+\d+", create_address)
                 ):
-                    return await self._create_chat_for_handle(chat_id, chunk)
+                    return await self._create_chat_for_handle(create_address, chunk)
                 return SendResult(
                     success=False,
                     error=f"BlueBubbles chat not found for target: {chat_id}",
@@ -449,7 +480,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     success=True, message_id=str(msg_id), raw_response=res
                 )
             except Exception as exc:
-                return SendResult(success=False, error=str(exc))
+                return SendResult(success=False, error=f"{type(exc).__name__}: {str(exc) or repr(exc)}")
         return last
 
     # ------------------------------------------------------------------
@@ -508,7 +539,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 error=result.get("message", "Attachment upload failed"),
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {str(e) or repr(e)}")
 
     async def send_image(
         self,

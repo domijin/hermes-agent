@@ -20,12 +20,13 @@ def _reset_signal_scheduler():
     yield
     _reset_scheduler()
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from tools.send_message_tool import (
     _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
     _send_matrix_via_adapter,
+    _send_bluebubbles,
     _send_signal,
     _send_telegram,
     _send_to_platform,
@@ -112,6 +113,77 @@ class TestSendMessageTool:
         assert "final response" in result["note"]
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bluebubbles_send_reuses_live_gateway_adapter(self, monkeypatch):
+        from gateway.platforms.base import SendResult
+
+        live_adapter = SimpleNamespace(
+            send=AsyncMock(return_value=SendResult(success=True, message_id="live-1"))
+        )
+        runner = SimpleNamespace(adapters={Platform.BLUEBUBBLES: live_adapter})
+
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+        monkeypatch.setattr(
+            "gateway.platforms.bluebubbles.BlueBubblesAdapter.connect_send_only",
+            AsyncMock(side_effect=AssertionError("fallback adapter should not connect")),
+        )
+
+        result = await _send_bluebubbles(PlatformConfig(extra={}), "any;-;+15551234567", "hello")
+
+        assert result["success"] is True
+        assert result["message_id"] == "live-1"
+        live_adapter.send.assert_awaited_once_with(chat_id="any;-;+15551234567", content="hello")
+
+    @pytest.mark.asyncio
+    async def test_bluebubbles_send_fallback_uses_send_only_adapter(self, monkeypatch):
+        from gateway.platforms.base import SendResult
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        send_mock = AsyncMock(return_value=SendResult(success=True, message_id="fallback-1"))
+        disconnect_mock = AsyncMock()
+
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr(BlueBubblesAdapter, "connect", AsyncMock(side_effect=AssertionError("full connect should not run")))
+        monkeypatch.setattr(BlueBubblesAdapter, "connect_send_only", AsyncMock(return_value=True))
+        monkeypatch.setattr(BlueBubblesAdapter, "send", send_mock)
+        monkeypatch.setattr(BlueBubblesAdapter, "disconnect", disconnect_mock)
+
+        result = await _send_bluebubbles(PlatformConfig(extra={}), "any;-;+15551234567", "hello")
+
+        assert result["success"] is True
+        assert result["message_id"] == "fallback-1"
+        send_mock.assert_awaited_once_with("any;-;+15551234567", "hello")
+        disconnect_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bluebubbles_send_falls_back_when_live_adapter_event_loop_fails(self, monkeypatch):
+        from gateway.platforms.base import SendResult
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        live_adapter = SimpleNamespace(
+            send=AsyncMock(
+                return_value=SendResult(
+                    success=False,
+                    error="RuntimeError: <asyncio.locks.Event object> is bound to a different event loop",
+                )
+            )
+        )
+        runner = SimpleNamespace(adapters={Platform.BLUEBUBBLES: live_adapter})
+        fallback_send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-after-loop-error"))
+
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+        monkeypatch.setattr(BlueBubblesAdapter, "connect", AsyncMock(side_effect=AssertionError("full connect should not run")))
+        monkeypatch.setattr(BlueBubblesAdapter, "connect_send_only", AsyncMock(return_value=True))
+        monkeypatch.setattr(BlueBubblesAdapter, "send", fallback_send)
+        monkeypatch.setattr(BlueBubblesAdapter, "disconnect", AsyncMock())
+
+        result = await _send_bluebubbles(PlatformConfig(extra={}), "any;-;+15551234567", "hello")
+
+        assert result["success"] is True
+        assert result["message_id"] == "fallback-after-loop-error"
+        live_adapter.send.assert_awaited_once_with(chat_id="any;-;+15551234567", content="hello")
+        fallback_send.assert_awaited_once_with("any;-;+15551234567", "hello")
 
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()

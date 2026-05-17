@@ -336,6 +336,17 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "bluebubbles":
+        raw = target_ref.strip()
+        if ";" in raw:
+            # BlueBubbles chat GUIDs use semicolon-delimited forms such as
+            # any;-;+15551234567. Treat them as explicit IDs so E.164 DMs do
+            # not fall through to the configured home channel.
+            return raw, None, True
+        match = _E164_TARGET_RE.fullmatch(raw)
+        if match:
+            # BlueBubbles stores 1:1 iMessage chats as GUIDs in this form.
+            return f"any;-;{raw}", None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -628,7 +639,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
-            result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
+            result = await _send_bluebubbles(pconfig, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
@@ -1551,31 +1562,55 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
         return _error(f"Weixin send failed: {e}")
 
 
-async def _send_bluebubbles(extra, chat_id, message):
-    """Send via BlueBubbles iMessage server using the adapter's REST API."""
+async def _send_bluebubbles(pconfig, chat_id, message):
+    """Send via BlueBubbles without rebinding the gateway webhook port.
+
+    Prefer the live gateway adapter when send_message is invoked inside a
+    running gateway process. Outside the gateway, fall back to an outbound-only
+    adapter connection that talks to the BlueBubbles REST API but does not start
+    or register an inbound webhook listener.
+    """
     try:
+        from gateway.config import Platform, PlatformConfig
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
         if not check_bluebubbles_requirements():
             return {"error": "BlueBubbles requirements not met (need aiohttp + httpx)."}
     except ImportError:
         return {"error": "BlueBubbles adapter not available."}
 
+    if isinstance(pconfig, dict):
+        pconfig = PlatformConfig(extra=pconfig)
+
     try:
-        from gateway.config import PlatformConfig
-        pconfig = PlatformConfig(extra=extra)
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        live_adapter = runner.adapters.get(Platform.BLUEBUBBLES) if runner else None
+        if live_adapter:
+            result = await live_adapter.send(chat_id=chat_id, content=message)
+            if result.success:
+                return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
+            logger.debug(
+                "BlueBubbles live adapter send failed; falling back to send-only adapter: %s",
+                result.error,
+            )
+    except Exception as e:
+        logger.debug("BlueBubbles live adapter send unavailable; falling back to send-only adapter: %s", e)
+
+    adapter = None
+    try:
         adapter = BlueBubblesAdapter(pconfig)
-        connected = await adapter.connect()
+        connected = await adapter.connect_send_only()
         if not connected:
             return _error("BlueBubbles: failed to connect to server")
-        try:
-            result = await adapter.send(chat_id, message)
-            if not result.success:
-                return _error(f"BlueBubbles send failed: {result.error}")
-            return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
-        finally:
-            await adapter.disconnect()
+        result = await adapter.send(chat_id, message)
+        if not result.success:
+            return _error(f"BlueBubbles send failed: {result.error}")
+        return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
     except Exception as e:
         return _error(f"BlueBubbles send failed: {e}")
+    finally:
+        if adapter is not None:
+            await adapter.disconnect()
 
 
 async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):
