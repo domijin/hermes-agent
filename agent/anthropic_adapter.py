@@ -675,6 +675,53 @@ def build_anthropic_client(
 
     Returns an anthropic.Anthropic instance.
     """
+    # --- SDK-shim gate (HERMES_USE_SDK_SHIM; kadabra #416) -------------------
+    # When enabled, route OAuth *subscription* tokens (sk-ant-oat*) through the
+    # claude-agent-sdk subprocess (the real `claude` CLI) for FIRST-PARTY billing
+    # instead of the prepaid-extra-usage HTTP path. Every client-build site (init
+    # in agent_init.py + the rotation/recovery paths in run_agent.py /
+    # agent_runtime_helpers.py) funnels through this function, so gating here
+    # covers them all with one fail-safe seam. Single-profile v1: the passed
+    # OAuth token IS the one profile; mcp_servers are sourced from the Hermes
+    # config; `model` arrives per-request via the shim's .messages.create().
+    # Any failure falls through to the normal HTTP client (never breaks the bot).
+    if (
+        os.environ.get("HERMES_USE_SDK_SHIM") == "1"
+        and isinstance(api_key, str)
+        and _is_oauth_token(api_key)
+    ):
+        try:
+            from agent.anthropic_sdk_subprocess_adapter import build_anthropic_sdk_client
+
+            try:
+                from tools.mcp_tool import _load_mcp_config
+
+                _mcp_servers = _load_mcp_config() or {}
+            except Exception as _mcp_exc:  # mcp config optional — degrade to no-tools
+                logger.warning("SDK-shim: mcp config load failed (%s); proceeding tool-less", _mcp_exc)
+                _mcp_servers = {}
+            logger.info(
+                "anthropic build: HERMES_USE_SDK_SHIM active -> claude-agent-sdk subprocess "
+                "(profile=%s, mcp_servers=%d)",
+                os.environ.get("HERMES_SDK_PROFILE_LABEL", "max-20x"),
+                len(_mcp_servers),
+            )
+            return build_anthropic_sdk_client(
+                profiles=[
+                    {
+                        "label": os.environ.get("HERMES_SDK_PROFILE_LABEL", "max-20x"),
+                        "token": api_key,
+                        "priority": 0,
+                    }
+                ],
+                mcp_servers=_mcp_servers,
+            )
+        except Exception as _shim_exc:
+            logger.warning(
+                "SDK-shim build failed (%s) -> falling back to HTTP Anthropic client",
+                _shim_exc,
+            )
+    # --- end SDK-shim gate ---------------------------------------------------
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
