@@ -1,0 +1,47 @@
+# vendors/hermes-agent: drop "private_channel" from users.conversations types
+# Applied 2026-05-22 (PR pending). Required because the hermes-work Slack
+# app (cursor_mcp_bot, T04Q2K244) lacks the `groups:read` OAuth scope.
+#
+# Symptom without this patch: Slack returns missing_scope for the
+# private_channel portion → entire users.conversations call fails →
+# channel_directory.json never builds → 5min refresh loop logs the
+# warning every cycle → log floods (6155 warnings / 27K lines observed
+# 2026-05-22).
+#
+# Re-apply after every re-pull of vendors/hermes-agent (see UPSTREAM.md):
+#   perl -i -pe 's|types="public_channel,private_channel"|types="public_channel"|' \
+#     vendors/hermes-agent/gateway/channel_directory.py
+#
+# Remove this patch if/when the Slack app's OAuth scopes are expanded
+# (workspace admin adds groups:read, mpim:read, im:read) and the bot is
+# re-installed. At that point types can revert to
+# "public_channel,private_channel,mpim,im" for full directory coverage.
+#
+# Unified diff:
+--- a/gateway/channel_directory.py
++++ b/gateway/channel_directory.py
+@@ -165,8 +165,21 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
+         try:
+             cursor: Optional[str] = None
+             for _page in range(20):  # safety cap on pagination
++                # --- domi-local-patch ---
++                # Dropped "private_channel" from the types list because the
++                # hermes-work Slack app (cursor_mcp_bot, T04Q2K244) doesn't
++                # have the `groups:read` OAuth scope. Including
++                # `private_channel` makes Slack return missing_scope and
++                # the call fails — leaving NO directory at all + flooding
++                # the log (6155 warnings / 27K lines = 23% of log volume
++                # observed 2026-05-22). The bot has `channels:read` (fine
++                # for public) but lacks `groups:read` / `mpim:read` /
++                # `im:read`, so public is the only subset that succeeds.
++                # Re-add other types if/when the Slack app's scopes are
++                # expanded by the workspace admin.
+                 response = await client.users_conversations(
+-                    types="public_channel,private_channel",
++                    types="public_channel",
+                     exclude_archived=True,
+                     limit=200,
+                     cursor=cursor,
+                 )
++                # --- end domi-local-patch ---
+                 if not response.get("ok"):

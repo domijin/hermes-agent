@@ -1,0 +1,521 @@
+# vendors/hermes-agent local patch — gateway/platforms/slack.py
+# Captured 2026-06-02 during the v0.13.0→v0.15.1 (v2026.5.29) re-vendor.
+# Diff is against pure upstream 0.15.1 (gateway/platforms/slack.py). Re-apply after every re-pull:
+#   (cd vendors/hermes-agent && git apply .local-patches/02-slack-public-channel-ux-option-a-is-cron.local-patch.diff)
+# Concern: public-channel UX (#169) + Option A default_channel_policy (#421) + is_cron bypass (#435)
+#
+# Unified diff:
+--- a/gateway/platforms/slack.py
++++ b/gateway/platforms/slack.py
+@@ -321,6 +321,15 @@
+         # Track pending approval message_ts → resolved flag to prevent
+         # double-clicks on approval buttons.
+         self._approval_resolved: Dict[str, bool] = {}
++        # --- domi-local-patch: send-approval async events ---
++        # Per-prompt asyncio.Event keyed by approval_key → result. Set by
++        # _handle_send_approval_action when a Block Kit button is clicked;
++        # awaited by _send_await_send_approval. Entries are popped on
++        # resolution to keep growth bounded.
++        # See docs/hermes-work-public-channel-spec.md req #3.
++        self._send_approval_events: Dict[str, asyncio.Event] = {}
++        self._send_approval_results: Dict[str, bool] = {}
++        # --- end domi-local-patch ---
+         # Track timestamps of messages sent by the bot so we can respond
+         # to thread replies even without an explicit @mention.
+         self._bot_message_ts: set = set()
+@@ -681,6 +690,16 @@
+             ):
+                 self._app.action(_action_id)(self._handle_slash_confirm_action)
+ 
++            # --- domi-local-patch: register send-approval button actions ---
++            # See docs/hermes-work-public-channel-spec.md req #3 (approve-send
++            # gating for public channels).
++            for _action_id in (
++                "hermes_send_approve",
++                "hermes_send_deny",
++            ):
++                self._app.action(_action_id)(self._handle_send_approval_action)
++            # --- end domi-local-patch ---
++
+             # Start Socket Mode handler in background
+             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
+             _apply_slack_proxy(self._handler.client, proxy_url)
+@@ -777,6 +796,66 @@
+                 return await self._send_slash_ephemeral(
+                     slash_ctx, content,
+                 )
++
++            # --- domi-local-patch: ephemeral_intermediate + approve_send routing ---
++            # Public-channel UX gates from docs/hermes-work-public-channel-spec.md.
++            # Req #2: when chat_id is in ephemeral_intermediate_in_channels, route
++            #   the send via chat.postEphemeral to ephemeral_recipients. Other
++            #   channel members see nothing.
++            # Req #3 (Option D, 2026-05-20): when chat_id is in
++            #   approve_send_in_channels AND the send carries
++            #   metadata['is_final']=True (set by base.py at the canonical
++            #   turn-final response site), present an ephemeral Block Kit
++            #   Approve/Deny prompt to ephemeral_recipients FIRST. On Approve
++            #   → fall through to chat_postMessage (public). On Deny → return
++            #   without posting. Non-final sends in the same channel are NOT
++            #   gated — they route via the ephemeral_intermediate path (or
++            #   default public if not in that list either).
++            # When a channel is in BOTH lists (the typical Option D config),
++            # the approval gate fires ONLY on the final send (one Approve
++            # click per turn); intermediates stay ephemeral; approved finals
++            # post publicly (the ephemeral list is bypassed for approved
++            # finals so the operator-approved reply is visible to all).
++            # Option A (2026-05-29): resolve the effective policy for this
++            # channel via _channel_policy()'s locked precedence (approve_send >
++            # ephemeral_intermediate > public_channels > default_channel_policy).
++            # Channels in NO explicit allowlist no longer fall through to a
++            # public post unconditionally — default_channel_policy governs them
++            # (deployed default: ephemeral_with_approval → safe-by-default).
++            is_final = bool(metadata and metadata.get("is_final"))
++            is_cron = bool(metadata and metadata.get("is_cron"))
++            if is_cron:
++                # Cron deliveries always post publicly — skip all policy gates.
++                # A scheduled job's output must reach the channel, not get held
++                # behind an ephemeral Approve prompt (the cron path has no
++                # operator at the keyboard to click it). cron/scheduler.py tags
++                # auto-deliveries with metadata['is_cron']=True. Fall through to
++                # chat_postMessage below.
++                pass
++            else:
++                policy = self._channel_policy(chat_id)
++                if policy == "ephemeral_with_approval" and is_final:
++                    # Final turn-send under an approval policy: gate Approve/Deny.
++                    approved = await self._send_await_send_approval(chat_id, content, metadata)
++                    if not approved:
++                        return SendResult(success=True, message_id=None, error="user-denied")
++                    # Approved → fall through to public chat_postMessage below.
++                elif policy == "ephemeral":
++                    return await self._send_ephemeral_to_recipients(chat_id, content, metadata)
++                elif policy == "ephemeral_with_approval":
++                    # Non-final (intermediate) send under an approval policy.
++                    # Route ephemerally so progress never leaks publicly — EXCEPT
++                    # preserve the legacy behavior for channels that are ONLY in
++                    # approve_send_in_channels (no ephemeral routing configured),
++                    # which historically posted intermediates publicly (Option D;
++                    # test_approve_channel_intermediate_send_no_approval).
++                    if (chat_id in self._slack_approve_send_in_channels()
++                            and chat_id not in self._slack_ephemeral_intermediate_in_channels()):
++                        pass  # legacy approve-only channel: intermediate → public
++                    else:
++                        return await self._send_ephemeral_to_recipients(chat_id, content, metadata)
++                # policy == "public" → fall through to public chat_postMessage below.
++            # --- end domi-local-patch ---
+ 
+             # Convert standard markdown → Slack mrkdwn
+             formatted = self.format_message(content)
+@@ -1929,11 +2008,19 @@
+         if team_id and channel_id:
+             self._channel_team[channel_id] = team_id
+ 
+-        # Determine if this is a DM or channel message
++        # Determine if this is a 1:1 DM (bypass gating) vs anything else.
++        # Group DMs (mpim) are intentionally NOT classified as DM here — they
++        # have multiple participants, so each user's message must be evaluated
++        # for @-mention the same way as in a public/private channel. Regression:
++        # 2026-05-19 C0B4PCSJHFC group-DM thread, bot auto-replied to an
++        # unmentioned message because the previous classification treated mpim
++        # as DM and bypassed strict_mention. See
++        # memory/scars/2026-05-19-cursor-mcp-bot-username-misdiagnosis.md and
++        # docs/hermes-work-public-channel-spec.md §6.
+         channel_type = event.get("channel_type", "")
+         if not channel_type and channel_id.startswith("D"):
+             channel_type = "im"
+-        is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
++        is_dm = self._is_classic_dm(channel_type, channel_id)
+ 
+         # Build thread_ts for session keying.
+         # In channels: fall back to ts so each top-level @mention starts a
+@@ -2979,6 +3066,29 @@
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             return bool(configured)
+         return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
++
++    @staticmethod
++    def _is_classic_dm(channel_type: str, channel_id: str) -> bool:
++        """Return True only for 1:1 DMs (channel_type='im' or D-prefix IDs).
++
++        Group DMs (channel_type='mpim') return False — they have multiple
++        participants, so each user's message must be evaluated for @-mention
++        gating the same way as a public/private channel.
++
++        Regression: 2026-05-19 — C0B4PCSJHFC group-DM thread bypassed
++        strict_mention because the original line 1933 classification
++        (`channel_type in {"im", "mpim"}`) treated mpim as a DM. See
++        memory/scars/2026-05-19-cursor-mcp-bot-username-misdiagnosis.md.
++        """
++        if channel_type == "im":
++            return True
++        # When channel_type is missing, Slack's D-prefix is reserved for 1:1 IM
++        # channels; G-prefix is reserved for group conversations (mpim, private
++        # channels). C-prefix is public channels. So D-prefix without an
++        # explicit channel_type is still a 1:1 DM.
++        if not channel_type and channel_id and channel_id.startswith("D"):
++            return True
++        return False
+ 
+     def _slack_strict_mention(self) -> bool:
+         """When true, channel threads require an explicit @-mention on every
+@@ -3008,8 +3118,359 @@
+         s = str(raw).strip() if raw is not None else ""
+         if s:
+             return {part.strip() for part in s.split(",") if part.strip()}
++        return set()
++
++    # --- domi-local-patch: public-channel UX config readers + helpers ---
++    # All members of this fence support docs/hermes-work-public-channel-spec.md
++    # reqs #2 (ephemeral intermediate) and #3 (approve-send gating).
++
++    def _slack_ephemeral_intermediate_in_channels(self) -> set:
++        """Channel IDs where SlackAdapter.send() routes via chat.postEphemeral
++        to ephemeral_recipients instead of chat_postMessage. Req #2.
++
++        Accepts a YAML list, CSV string, or env override
++        ``SLACK_EPHEMERAL_INTERMEDIATE_IN_CHANNELS``. Empty / unset disables.
++        """
++        raw = self.config.extra.get("ephemeral_intermediate_in_channels")
++        if raw is None:
++            raw = os.getenv("SLACK_EPHEMERAL_INTERMEDIATE_IN_CHANNELS", "")
++        if isinstance(raw, list):
++            return {str(p).strip() for p in raw if str(p).strip()}
++        s = str(raw).strip() if raw is not None else ""
++        if s:
++            return {p.strip() for p in s.split(",") if p.strip()}
+         return set()
+ 
++    def _slack_ephemeral_recipients(self) -> list:
++        """Slack user IDs (U...) authorized to see ephemeral intermediate
++        output and approve sends in
++        ``ephemeral_intermediate_in_channels`` / ``approve_send_in_channels``.
++
++        Order-preserving list (each recipient is sent a copy of the message
++        via chat.postEphemeral). Accepts YAML list, CSV string, or env
++        ``SLACK_EPHEMERAL_RECIPIENTS``. Empty / unset → no recipients (sends
++        in target channels are dropped rather than going public; see
++        _send_ephemeral_to_recipients).
++        """
++        raw = self.config.extra.get("ephemeral_recipients")
++        if raw is None:
++            raw = os.getenv("SLACK_EPHEMERAL_RECIPIENTS", "")
++        if isinstance(raw, list):
++            return [str(p).strip() for p in raw if str(p).strip()]
++        s = str(raw).strip() if raw is not None else ""
++        if s:
++            return [p.strip() for p in s.split(",") if p.strip()]
++        return []
++
++    def _slack_approve_send_in_channels(self) -> set:
++        """Channel IDs where every chat_postMessage send is gated on an
++        ephemeral Approve/Deny prompt presented to ephemeral_recipients. Req #3.
++
++        Same parsing as _slack_ephemeral_intermediate_in_channels. Env override:
++        ``SLACK_APPROVE_SEND_IN_CHANNELS``.
++        """
++        raw = self.config.extra.get("approve_send_in_channels")
++        if raw is None:
++            raw = os.getenv("SLACK_APPROVE_SEND_IN_CHANNELS", "")
++        if isinstance(raw, list):
++            return {str(p).strip() for p in raw if str(p).strip()}
++        s = str(raw).strip() if raw is not None else ""
++        if s:
++            return {p.strip() for p in s.split(",") if p.strip()}
++        return set()
++
++    # Legal values for default_channel_policy (Option A).
++    _VALID_CHANNEL_POLICIES = ("public", "ephemeral", "ephemeral_with_approval")
++
++    def _slack_default_channel_policy(self) -> str:
++        """Fall-through send() policy for channels in NONE of the explicit
++        allowlists (approve_send / ephemeral_intermediate / public_channels).
++        One of ``public`` / ``ephemeral`` / ``ephemeral_with_approval``.
++
++        Default if unset: ``public`` — back-compat, since the pre-Option-A
++        behavior posted unlisted channels publicly. Accepts the
++        ``default_channel_policy`` extra key or env override
++        ``SLACK_DEFAULT_CHANNEL_POLICY``. Unknown / malformed values are coerced
++        to ``public`` (a live send must never raise on a typo'd config). Option A.
++        """
++        raw = self.config.extra.get("default_channel_policy")
++        if raw is None:
++            raw = os.getenv("SLACK_DEFAULT_CHANNEL_POLICY", "")
++        policy = str(raw).strip().lower() if raw is not None else ""
++        if policy in self._VALID_CHANNEL_POLICIES:
++            return policy
++        if policy:
++            logger.warning(
++                "[Slack] invalid default_channel_policy %r — falling back to "
++                "'public' (legal values: %s)",
++                policy, ", ".join(self._VALID_CHANNEL_POLICIES),
++            )
++        return "public"
++
++    def _slack_public_channels(self) -> set:
++        """Channel IDs that explicitly opt OUT of a non-public
++        ``default_channel_policy`` and post publicly. Sits below the two
++        ephemeral lists and above the default in the precedence order. Same
++        parsing as the sibling readers; env override ``SLACK_PUBLIC_CHANNELS``.
++        Empty / unset disables. Option A.
++        """
++        raw = self.config.extra.get("public_channels")
++        if raw is None:
++            raw = os.getenv("SLACK_PUBLIC_CHANNELS", "")
++        if isinstance(raw, list):
++            return {str(p).strip() for p in raw if str(p).strip()}
++        s = str(raw).strip() if raw is not None else ""
++        if s:
++            return {p.strip() for p in s.split(",") if p.strip()}
++        return set()
++
++    def _channel_policy(self, chat_id: str) -> str:
++        """Resolve the effective send policy for ``chat_id`` via the locked
++        precedence (FIRST match wins):
++
++        1. ``approve_send_in_channels``         → ``ephemeral_with_approval``
++        2. ``ephemeral_intermediate_in_channels`` → ``ephemeral``
++        3. ``public_channels``                  → ``public``
++        4. otherwise                            → ``default_channel_policy``
++
++        The explicit lists are matched WITHOUT regard to ``is_final``; the
++        is_final coupling for the approval gate lives in ``send()`` (the gate
++        fires only on the canonical turn-final send — intermediates stay
++        ephemeral). Option A.
++        """
++        if chat_id in self._slack_approve_send_in_channels():
++            return "ephemeral_with_approval"
++        if chat_id in self._slack_ephemeral_intermediate_in_channels():
++            return "ephemeral"
++        if chat_id in self._slack_public_channels():
++            return "public"
++        return self._slack_default_channel_policy()
++
++    async def _send_ephemeral_to_recipients(
++        self,
++        chat_id: str,
++        content: str,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send ``content`` ephemerally to every user in ephemeral_recipients.
++
++        Used when chat_id is in ephemeral_intermediate_in_channels. Channel
++        members other than the recipients see nothing. If no recipients are
++        configured, log a warning and drop the message silently (better than
++        leaking to the public channel — matches operator intent).
++        """
++        recipients = self._slack_ephemeral_recipients()
++        if not recipients:
++            logger.warning(
++                "[Slack] ephemeral_intermediate_in_channels includes %s but "
++                "ephemeral_recipients is empty — message dropped (refuses to "
++                "fall back to public post).",
++                chat_id,
++            )
++            return SendResult(success=True, message_id=None, error="no-recipients-configured")
++
++        formatted = self.format_message(content)
++        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++        thread_ts = self._resolve_thread_ts(None, metadata)
++
++        for chunk in chunks:
++            for user_id in recipients:
++                kwargs: Dict[str, Any] = {
++                    "channel": chat_id,
++                    "user": user_id,
++                    "text": chunk,
++                }
++                if thread_ts:
++                    kwargs["thread_ts"] = thread_ts
++                try:
++                    await self._get_client(chat_id).chat_postEphemeral(**kwargs)
++                except Exception as e:
++                    logger.warning(
++                        "[Slack] chat_postEphemeral failed for user %s in %s: %s",
++                        user_id, chat_id, e,
++                    )
++        return SendResult(success=True, message_id=None)
++
++    async def _send_await_send_approval(
++        self,
++        chat_id: str,
++        content: str,
++        metadata: Optional[Dict[str, Any]] = None,
++        timeout: float = 600.0,
++    ) -> bool:
++        """Post an ephemeral Approve/Deny prompt to ephemeral_recipients; block
++        until a button is clicked (or timeout). Returns True on Approve,
++        False on Deny / timeout / no-recipients-configured.
++
++        Reuses the Block Kit action_id pattern from send_exec_approval. Each
++        prompt has a unique approval_key value attached to the buttons so
++        clicks resolve the right asyncio.Event.
++        """
++        recipients = self._slack_ephemeral_recipients()
++        if not recipients:
++            logger.warning(
++                "[Slack] approve_send_in_channels includes %s but "
++                "ephemeral_recipients is empty — denying by default "
++                "(no one to ask).",
++                chat_id,
++            )
++            return False
++
++        preview = content if len(content) <= 2900 else content[:2900] + "..."
++        thread_ts = self._resolve_thread_ts(None, metadata)
++        approval_key = (
++            f"send-approval:{chat_id}:"
++            f"{int(asyncio.get_event_loop().time() * 1000)}"
++        )
++        event = asyncio.Event()
++        self._send_approval_events[approval_key] = event
++
++        blocks = [
++            {
++                "type": "section",
++                "text": {
++                    "type": "mrkdwn",
++                    "text": (
++                        f":eyes: *Approve public post to <#{chat_id}>?*\n"
++                        f"```{preview}```"
++                    ),
++                },
++            },
++            {
++                "type": "actions",
++                "elements": [
++                    {
++                        "type": "button",
++                        "text": {"type": "plain_text", "text": "Approve"},
++                        "style": "primary",
++                        "action_id": "hermes_send_approve",
++                        "value": approval_key,
++                    },
++                    {
++                        "type": "button",
++                        "text": {"type": "plain_text", "text": "Deny"},
++                        "style": "danger",
++                        "action_id": "hermes_send_deny",
++                        "value": approval_key,
++                    },
++                ],
++            },
++        ]
++
++        post_kwargs: Dict[str, Any] = {
++            "channel": chat_id,
++            "text": "Approve public post?",
++            "blocks": blocks,
++        }
++        if thread_ts:
++            post_kwargs["thread_ts"] = thread_ts
++
++        for user_id in recipients:
++            try:
++                await self._get_client(chat_id).chat_postEphemeral(
++                    user=user_id, **post_kwargs,
++                )
++            except Exception as e:
++                logger.warning(
++                    "[Slack] approval prompt postEphemeral failed for %s: %s",
++                    user_id, e,
++                )
++
++        try:
++            await asyncio.wait_for(event.wait(), timeout=timeout)
++            return bool(self._send_approval_results.get(approval_key, False))
++        except asyncio.TimeoutError:
++            logger.warning(
++                "[Slack] send-approval timed out after %.0fs for %s — denying.",
++                timeout, chat_id,
++            )
++            return False
++        finally:
++            self._send_approval_events.pop(approval_key, None)
++            self._send_approval_results.pop(approval_key, None)
++
++    async def _handle_send_approval_action(self, ack, body, action, respond=None) -> None:
++        """Block Kit button-click handler for hermes_send_approve /
++        hermes_send_deny. Sets the corresponding asyncio.Event keyed by
++        approval_key (carried in the button's ``value``), then replaces
++        the ephemeral prompt with a confirmation so the buttons don't
++        linger after the click.
++
++        Slack ephemeral messages can only be updated via the action's
++        ``response_url``; ``chat_update`` is rejected for ephemerals. We
++        use slack-bolt's ``respond`` callback which posts to that URL.
++        """
++        await ack()
++        action_id = action.get("action_id", "")
++        approval_key = action.get("value", "")
++        if not approval_key:
++            return
++        event = self._send_approval_events.get(approval_key)
++        if event is None:
++            # Prompt expired or already resolved.
++            return
++        # Defense-in-depth: Slack ephemeral visibility already restricts who can
++        # see + click the prompt, but verify the clicker is on the allowlist.
++        user_id = body.get("user", {}).get("id", "")
++        user_name = body.get("user", {}).get("name") or user_id or "unknown"
++        allowed = set(self._slack_ephemeral_recipients())
++        if allowed and user_id not in allowed:
++            logger.warning(
++                "[Slack] unauthorized send-approval click by %s — ignoring.",
++                user_id,
++            )
++            return
++        approved = action_id == "hermes_send_approve"
++        self._send_approval_results[approval_key] = approved
++        event.set()
++
++        # Replace the prompt with a confirmation so buttons don't linger.
++        # ``respond`` is injected by slack-bolt with the action's
++        # ``response_url``; it may be absent in unit tests — skip silently.
++        if respond is None:
++            return
++        decision_text = (
++            f"✅ Approved by {user_name} — posting publicly."
++            if approved
++            else f"❌ Denied by {user_name} — no public post."
++        )
++        # Preserve the original draft text from the prompt's section block
++        # so the operator can still see what they approved after the
++        # buttons are removed.
++        original_text = ""
++        try:
++            for block in body.get("message", {}).get("blocks", []) or []:
++                if block.get("type") == "section":
++                    txt = block.get("text") or {}
++                    if isinstance(txt, dict):
++                        original_text = txt.get("text", "")
++                    break
++        except Exception:
++            original_text = ""
++        updated_blocks = [
++            {
++                "type": "section",
++                "text": {
++                    "type": "mrkdwn",
++                    "text": original_text or decision_text,
++                },
++            },
++            {
++                "type": "context",
++                "elements": [{"type": "mrkdwn", "text": decision_text}],
++            },
++        ]
++        try:
++            await respond(
++                replace_original=True,
++                text=decision_text,
++                blocks=updated_blocks,
++            )
++        except Exception as e:
++            logger.warning("[Slack] Failed to update send-approval prompt: %s", e)
++
++    # --- end domi-local-patch ---
++
+     def _slack_allowed_channels(self) -> set:
+         """Return the whitelist of channel IDs the bot will respond in.
+ 

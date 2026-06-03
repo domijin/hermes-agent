@@ -1,0 +1,193 @@
+# vendors/hermes-agent local patch — tests/gateway/test_slack_mention.py
+# Captured 2026-06-02 during the v0.13.0→v0.15.1 (v2026.5.29) re-vendor.
+# Diff is against pure upstream 0.15.1 (tests/gateway/test_slack_mention.py). Re-apply after every re-pull:
+#   (cd vendors/hermes-agent && git apply .local-patches/06-test-slack-mention.local-patch.diff)
+# Concern: strict @-mention test (#169)
+#
+# Unified diff:
+--- a/tests/gateway/test_slack_mention.py
++++ b/tests/gateway/test_slack_mention.py
+@@ -7,6 +7,8 @@
+ import sys
+ from unittest.mock import MagicMock
+ 
++import pytest
++
+ from gateway.config import Platform, PlatformConfig
+ 
+ 
+@@ -238,14 +240,22 @@
+ # Tests: mention gating integration (simulating _handle_slack_message logic)
+ # ---------------------------------------------------------------------------
+ 
+-def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
++def _would_process(adapter, *, is_dm=False, channel_type=None, channel_id=CHANNEL_ID,
+                    text="hello", mentioned=False, thread_reply=False,
+                    active_session=False):
+     """Simulate the mention gating logic from _handle_slack_message.
+ 
+     Returns True if the message would be processed, False if it would be
+     skipped (returned early).
++
++    Pass either ``is_dm`` (legacy boolean) or ``channel_type`` (newer; the
++    parameter that production code uses). When ``channel_type`` is supplied,
++    ``is_dm`` is computed via the production helper ``_is_classic_dm`` — so
++    callers that pass ``channel_type='mpim'`` get the correct (non-DM)
++    classification used in real message handling.
+     """
++    if channel_type is not None:
++        is_dm = adapter._is_classic_dm(channel_type, channel_id)
+     bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
+     if mentioned:
+         text = f"<@{bot_uid}> {text}"
+@@ -261,6 +271,8 @@
+             return True
+         elif not adapter._slack_require_mention():
+             return True
++        elif adapter._slack_strict_mention() and not is_mentioned:
++            return False  # strict mode: must be mentioned every message
+         elif not is_mentioned:
+             if thread_reply and active_session:
+                 return True
+@@ -687,3 +699,141 @@
+     import os as _os
+     # env var must not be overwritten by config.yaml
+     assert _os.environ["SLACK_ALLOWED_CHANNELS"] == OTHER_CHANNEL_ID
++
++
++# ---------------------------------------------------------------------------
++# Tests: _is_classic_dm classifier (regression: 2026-05-19 group DM bypass)
++# ---------------------------------------------------------------------------
++#
++# The classifier separates 1:1 DMs (which bypass channel gating because the
++# user explicitly opened a chat with the bot) from group DMs (which have
++# multiple participants and must follow the same @-mention gating as channels).
++#
++# Background: prior to 2026-05-19 the production code treated channel_type
++# 'mpim' as a DM, so strict_mention never applied in group DMs. The
++# C0B4PCSJHFC incident was a bot auto-replying to an unmentioned reply in a
++# 3-person group DM. The classifier below + the call site in
++# _handle_slack_message restore the intended gating behavior.
++
++GROUP_DM_ID = "G09GROUPDM12"
++DM_ID = "DABCDEF1234"
++
++
++def test_is_classic_dm_im_returns_true():
++    """channel_type='im' is a 1:1 DM — bypass channel gating."""
++    assert SlackAdapter._is_classic_dm("im", DM_ID) is True
++
++
++def test_is_classic_dm_mpim_returns_false():
++    """channel_type='mpim' (group DM) is NOT a classic DM — follow channel gating.
++
++    Regression: 2026-05-19 C0B4PCSJHFC group-DM thread.
++    """
++    assert SlackAdapter._is_classic_dm("mpim", GROUP_DM_ID) is False
++
++
++def test_is_classic_dm_mpim_with_c_id_returns_false():
++    """Group DM ID prefix is irrelevant — channel_type='mpim' is authoritative."""
++    assert SlackAdapter._is_classic_dm("mpim", "C09SOMECHANNEL") is False
++
++
++def test_is_classic_dm_d_prefix_id_fallback_returns_true():
++    """When channel_type is empty, D-prefix IDs are Slack's marker for 1:1 IM."""
++    assert SlackAdapter._is_classic_dm("", DM_ID) is True
++
++
++def test_is_classic_dm_c_prefix_id_no_type_returns_false():
++    """Without channel_type, C-prefix IDs are public channels — not a DM."""
++    assert SlackAdapter._is_classic_dm("", CHANNEL_ID) is False
++
++
++def test_is_classic_dm_g_prefix_id_no_type_returns_false():
++    """Without channel_type, G-prefix IDs are group conversations — not a 1:1 DM."""
++    assert SlackAdapter._is_classic_dm("", GROUP_DM_ID) is False
++
++
++def test_is_classic_dm_channel_type_returns_false():
++    """Public/private channels are never DMs."""
++    assert SlackAdapter._is_classic_dm("channel", CHANNEL_ID) is False
++
++
++# ---------------------------------------------------------------------------
++# Tests: group DM strict_mention gating (the C0B4PCSJHFC regression)
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture
++def _clean_slack_env(monkeypatch):
++    """Strip env vars that earlier tests' load_gateway_config() may have leaked.
++
++    `load_gateway_config()` writes to os.environ directly, and monkeypatch's
++    autouse cleanup only reverts its own setenv calls — not env vars set as a
++    side effect by code under test. The group-DM tests below assert behavior
++    in an unconfigured channel, so we explicitly clear the relevant vars.
++    """
++    for var in (
++        "SLACK_REQUIRE_MENTION",
++        "SLACK_STRICT_MENTION",
++        "SLACK_FREE_RESPONSE_CHANNELS",
++        "SLACK_ALLOWED_CHANNELS",
++    ):
++        monkeypatch.delenv(var, raising=False)
++
++
++def test_group_dm_strict_mention_blocks_unmentioned_message(_clean_slack_env):
++    """Group DM + strict_mention=True + no @-mention → bot must NOT respond.
++
++    Regression: 2026-05-19 — Sara Li posted in C0B4PCSJHFC without mentioning
++    the bot; the bot auto-continued the thread and replied 9 seconds later.
++    The fix is to treat group DMs as channels for gating purposes.
++    """
++    adapter = _make_adapter(strict_mention=True, require_mention=True)
++    assert _would_process(
++        adapter,
++        channel_type="mpim",
++        channel_id=GROUP_DM_ID,
++        text="follow-up without mention",
++        mentioned=False,
++    ) is False
++
++
++def test_group_dm_strict_mention_processes_mentioned_message(_clean_slack_env):
++    """Group DM + strict_mention=True + @-mention → bot SHOULD respond."""
++    adapter = _make_adapter(strict_mention=True, require_mention=True)
++    assert _would_process(
++        adapter,
++        channel_type="mpim",
++        channel_id=GROUP_DM_ID,
++        text="hello bot",
++        mentioned=True,
++    ) is True
++
++
++def test_classic_dm_strict_mention_still_bypassed(_clean_slack_env):
++    """1:1 DM should still bypass strict_mention — user opened the chat explicitly."""
++    adapter = _make_adapter(strict_mention=True, require_mention=True)
++    assert _would_process(
++        adapter,
++        channel_type="im",
++        channel_id=DM_ID,
++        text="follow-up without mention",
++        mentioned=False,
++    ) is True
++
++
++def test_group_dm_require_mention_only_blocks_unmentioned_without_session(_clean_slack_env):
++    """Group DM + require_mention=True (no strict) + no @ + no session → don't process.
++
++    Without strict_mention, the legacy thread-auto-continuation path applies:
++    only mentioned-threads or active sessions can keep the bot replying.
++    """
++    adapter = _make_adapter(strict_mention=False, require_mention=True)
++    assert _would_process(
++        adapter,
++        channel_type="mpim",
++        channel_id=GROUP_DM_ID,
++        text="unmentioned reply, no session",
++        mentioned=False,
++        thread_reply=False,
++        active_session=False,
++    ) is False

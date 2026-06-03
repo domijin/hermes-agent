@@ -1,0 +1,43 @@
+# vendors/hermes-agent local patch — gateway/platforms/base.py
+# Captured 2026-06-02 during the v0.13.0→v0.15.1 (v2026.5.29) re-vendor.
+# Diff is against pure upstream 0.15.1 (gateway/platforms/base.py). Re-apply after every re-pull:
+#   (cd vendors/hermes-agent && git apply .local-patches/03-base-is-final-metadata-flag.local-patch.diff)
+# Concern: is_final metadata flag — set here, read by slack gating (#421/#435)
+#
+# Unified diff:
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3698,18 +3698,26 @@
+                 if text_content and not _tts_caption_delivered:
+                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                     _reply_anchor = _reply_anchor_for_event(event)
+-                    # Mark final response messages for notification delivery.
+-                    # Platform adapters that support per-message notification
+-                    # control (e.g. Telegram's disable_notification) use this
+-                    # flag to override silent-mode and ensure the final
+-                    # response triggers a push notification.
++                    # Mark final response messages with both:
++                    #   - "notify": platform adapters that support per-message
++                    #     notification control (e.g. Telegram's
++                    #     disable_notification) use this to override silent-
++                    #     mode and ensure the final response triggers a push.
++                    #   - "is_final": adapters that gate sends by intermediate-
++                    #     vs-final classification (e.g. Slack's
++                    #     approve_send_in_channels req #3, Option D) use this
++                    #     to fire the approval flow only on the user-visible
++                    #     turn-final reply, not on every intermediate tool-
++                    #     progress send.  See
++                    #     docs/hermes-work-public-channel-spec.md §6.
+                     # Clone to avoid mutating the metadata shared with the
+                     # typing-indicator task (which must remain unmarked).
+                     if _thread_metadata is not None:
+                         _thread_metadata = dict(_thread_metadata)
+-                        _thread_metadata["notify"] = True
+                     else:
+-                        _thread_metadata = {"notify": True}
++                        _thread_metadata = {}
++                    _thread_metadata["notify"] = True
++                    _thread_metadata["is_final"] = True
+                     result = await self._send_with_retry(
+                         chat_id=event.source.chat_id,
+                         content=text_content,

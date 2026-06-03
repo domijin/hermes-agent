@@ -1,0 +1,83 @@
+# vendors/hermes-agent local patch — tests/cron/test_scheduler.py
+# Captured 2026-06-02 during the v0.13.0→v0.15.1 (v2026.5.29) re-vendor.
+# Diff is against pure upstream 0.15.1 (tests/cron/test_scheduler.py). Re-apply after every re-pull:
+#   (cd vendors/hermes-agent && git apply .local-patches/05-test-scheduler-is-cron.local-patch.diff)
+# Concern: is_cron test + upstream thread-fallback test metadata expectation
+#
+# Unified diff:
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -656,7 +656,54 @@
+         adapter.send_voice.assert_called_once()
+         voice_call = adapter.send_voice.call_args
+         assert voice_call[1]["audio_path"] == str(media_path)
++
++    def test_cron_auto_delivery_tags_send_metadata_is_cron(self):
++        """Cron auto-deliveries must tag send_metadata with is_cron=True so the
++        Slack adapter bypasses its default_channel_policy gate (Option A) — a
++        scheduled job has no operator at the keyboard to click an Approve
++        prompt. is_final is also set for downstream turn-final consumers."""
++        from gateway.config import Platform
++        from concurrent.futures import Future
++
++        adapter = AsyncMock()
++        adapter.send.return_value = MagicMock(success=True)
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+ 
++        loop = MagicMock()
++        loop.is_running.return_value = True
++
++        def fake_run_coro(coro, _loop):
++            future = Future()
++            future.set_result(MagicMock(success=True))
++            coro.close()
++            return future
++
++        job = {
++            "id": "cron-policy-job",
++            "deliver": "origin",
++            "origin": {"platform": "discord", "chat_id": "9876"},
++        }
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
++             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
++            _deliver_result(
++                job,
++                "Scheduled summary output.",
++                adapters={Platform.DISCORD: adapter},
++                loop=loop,
++            )
++
++        adapter.send.assert_called_once()
++        meta = adapter.send.call_args.kwargs["metadata"]
++        assert meta is not None, "cron delivery must pass send_metadata, not None"
++        assert meta.get("is_cron") is True
++        assert meta.get("is_final") is True
++
+     def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
+         """Image MEDIA files should be routed to send_image_file, not send_voice."""
+         from gateway.config import Platform
+@@ -2528,11 +2575,17 @@
+             "configured thread_id 7072 for telegram:226252250 was not found; "
+             "delivered without thread_id"
+         )
++        # --- domi-local-patch ---
++        # is_cron/is_final added to ALL cron deliveries by our scheduler patch
++        # (#435 — lets the Slack adapter bypass default_channel_policy for
++        # operator-less scheduled jobs). This upstream test asserted the bare
++        # thread_id metadata; updated to match the patched send_metadata shape.
+         adapter.send.assert_called_once_with(
+             "226252250",
+             "Hello world",
+-            metadata={"thread_id": "7072"},
++            metadata={"thread_id": "7072", "is_cron": True, "is_final": True},
+         )
++        # --- end domi-local-patch ---
+ 
+ 
+ class TestSendMediaTimeoutCancelsFuture:

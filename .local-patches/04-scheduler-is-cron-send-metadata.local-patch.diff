@@ -1,0 +1,24 @@
+# vendors/hermes-agent local patch — cron/scheduler.py
+# Captured 2026-06-02 during the v0.13.0→v0.15.1 (v2026.5.29) re-vendor.
+# Diff is against pure upstream 0.15.1 (cron/scheduler.py). Re-apply after every re-pull:
+#   (cd vendors/hermes-agent && git apply .local-patches/04-scheduler-is-cron-send-metadata.local-patch.diff)
+# Concern: is_cron/is_final on cron send_metadata (#435)
+#
+# Unified diff:
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -716,7 +716,13 @@
+         runtime_adapter = (adapters or {}).get(platform)
+         delivered = False
+         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+-            send_metadata = {"thread_id": thread_id} if thread_id else None
++            # Tag cron auto-deliveries so platform adapters route them as a
++            # terminal, operator-less delivery: is_cron lets the Slack adapter
++            # bypass its default_channel_policy gate (Option A) — a scheduled
++            # job's output must reach the channel, not stall behind an ephemeral
++            # Approve prompt nobody is there to click. is_final marks it a
++            # turn-final send for downstream consumers.
++            send_metadata = {"thread_id": thread_id, "is_cron": True, "is_final": True}
+             try:
+                 # Send cleaned text (MEDIA tags stripped) — not the raw content
+                 text_to_send = cleaned_delivery_content.strip()
